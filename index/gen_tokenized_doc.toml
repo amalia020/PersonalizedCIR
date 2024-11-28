@@ -3,16 +3,15 @@ title = "tokenizing the collection (all passaages) for later embedding generatio
 
 # [Model]
 model_type = "ANCE"
-pretrained_passage_encoder = "checkpoints/ad-hoc-ance-msmarco"   # passage encoder!!!
+pretrained_passage_encoder = "3ricL/ad-hoc-ance-msmarco"   # passage encoder!!!
 max_seq_length = 384    # The maximum total input sequence length after tokenization. Sequences longer than this will be truncated, sequences shorter will be padded."
 max_doc_character = 10000   # used before tokenizer to save tokenizer latency
 
 
 # [Input Data]
-raw_collection_path = "datasets/cast/collection.tsv"
+raw_collection_path = "/scratch-shared/ikat23/jsonl_passages/collection.jsonl"
 
 
 
 # [Output]
-
-data_output_path = "datasets/cast/tokenized"
+data_output_path = "/scratch-shared/ikat23/tokenized"
