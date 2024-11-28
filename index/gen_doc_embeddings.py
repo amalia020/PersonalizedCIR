@@ -1,34 +1,27 @@
 import sys
-
-sys.path += ['../']
-import torch
 import os
-from utils import (
-    barrier_array_merge,
-    StreamingDataset,
-    EmbeddingCache,
-)
+# so we can succesfully import pcir
+sys.path.append(os.path.dirname(os.path.abspath(__file__)).rsplit('/', 1)[0])
+
+import argparse
+import gc
+import pickle
+import logging
+
+import torch
+import toml
 from torch import nn
 import torch.distributed as dist
 from tqdm import tqdm
 from torch.utils.data import TensorDataset
 from torch.utils.data import DataLoader
 import numpy as np
-import argparse
-import re
-import gc
-import pickle
-# from transformers import DPRContextEncoderTokenizer, DPRContextEncoder
-from models import load_model
-from utils import check_dir_exist_or_build
-from IPython import embed
-import toml
+
+from pcir.data_structure import StreamingDataset, EmbeddingCache
+from pcir.models import load_model
+
 torch.multiprocessing.set_sharing_strategy('file_system')
-
-import logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', force=True)
 
 def GetProcessingFn(args, query=False):
     def fn(vals, i):
@@ -62,6 +55,8 @@ def GetProcessingFn(args, query=False):
 
 
 
+import torch
+
 def InferenceEmbeddingFromStreamDataLoader(
     args,
     model,
@@ -73,8 +68,8 @@ def InferenceEmbeddingFromStreamDataLoader(
     eval_batch_size = max(1, args.n_gpu) * args.per_gpu_eval_batch_size
 
     # Inference!
-    logger.info("***** Running ANN Embedding Inference *****")
-    logger.info("  Batch size = %d", eval_batch_size)
+    logging.info("***** Running ANN Embedding Inference *****")
+    logging.info("  Batch size = %d", eval_batch_size)
 
     embedding = []
     embedding2id = []
@@ -84,24 +79,35 @@ def InferenceEmbeddingFromStreamDataLoader(
     model.eval()
 
     tmp_n = 0
-    expect_per_block_passage_num = 2500000 # 54573064 38636512
-    block_size = expect_per_block_passage_num // eval_batch_size # 1000
+    expect_per_block_passage_num = 2500000  # Adjust if necessary
+    block_size = expect_per_block_passage_num // eval_batch_size  # 1000
     block_id = 0
     total_write_passages = 0
 
-    for batch in tqdm(train_dataloader,
-                    desc="Inferencing",
-                    disable=args.disable_tqdm,
-                    position=0,
-                    leave=True):
+    # Compute total number of steps
+    total_steps = (args.total_passages + eval_batch_size - 1) // eval_batch_size
 
-        #if batch[3][-1] <= 19999999:
-        #    logger.info("Current {} ".format(batch[3][-1]))
-        #    continue
+    # GPU device properties for memory monitoring
+    device = torch.cuda.get_device_properties(0)
+    total_memory = device.total_memory / 1024 / 1024 / 1024  # Convert to GB
+    logging.info(f"Total GPU memory: {total_memory:.2f}GB")
+
+    for batch in tqdm(train_dataloader,
+                      desc="Inferencing",
+                      disable=args.disable_tqdm,
+                      total=total_steps,
+                      position=0,
+                      leave=True):
 
         idxs = batch[3].detach().numpy()  # [#B]
-
         batch = tuple(t.to(args.device) for t in batch)
+        
+        # Memory monitoring before processing
+        logging.info("Memory usage before batch processing:")
+        logging.info("Allocated: %fGB", torch.cuda.memory_allocated(0) / 1024 / 1024 / 1024)
+        logging.info("Reserved: %fGB", torch.cuda.memory_reserved(0) / 1024 / 1024 / 1024)
+        logging.info("Max Reserved: %fGB", torch.cuda.max_memory_reserved(0) / 1024 / 1024 / 1024)
+
         with torch.no_grad():
             inputs = {
                 "input_ids": batch[0].long(),
@@ -110,8 +116,8 @@ def InferenceEmbeddingFromStreamDataLoader(
             embs = model(inputs["input_ids"], inputs["attention_mask"])
 
         embs = embs.detach().cpu().numpy()
-    
-        # check for multi chunk output for long sequence
+
+        # check for multi-chunk output for long sequence
         if len(embs.shape) == 3:
             for chunk_no in range(embs.shape[1]):
                 embedding2id.append(idxs)
@@ -119,10 +125,10 @@ def InferenceEmbeddingFromStreamDataLoader(
         else:
             embedding2id.append(idxs)
             embedding.append(embs)
-        
+
         tmp_n += 1
         if tmp_n % 500 == 0:
-            logger.info("Have processed {} batches...".format(tmp_n))
+            logging.info("Processed {} batches...".format(tmp_n))
 
         if tmp_n % block_size == 0:
             embedding = np.concatenate(embedding, axis=0)
@@ -136,12 +142,18 @@ def InferenceEmbeddingFromStreamDataLoader(
             total_write_passages += len(embedding)
             block_id += 1
 
-            logger.info("Have written {} passages...".format(total_write_passages))
+            logging.info("Written {} passages so far...".format(total_write_passages))
             embedding = []
             embedding2id = []
             gc.collect()
 
-    if len(embedding) > 0:   
+        # Memory monitoring after processing each batch
+        logging.info("Memory usage after batch processing:")
+        logging.info("Allocated: %fGB", torch.cuda.memory_allocated(0) / 1024 / 1024 / 1024)
+        logging.info("Reserved: %fGB", torch.cuda.memory_reserved(0) / 1024 / 1024 / 1024)
+        logging.info("Max Reserved: %fGB", torch.cuda.max_memory_reserved(0) / 1024 / 1024 / 1024)
+
+    if len(embedding) > 0:
         embedding = np.concatenate(embedding, axis=0)
         embedding2id = np.concatenate(embedding2id, axis=0)
 
@@ -154,8 +166,7 @@ def InferenceEmbeddingFromStreamDataLoader(
         total_write_passages += len(embedding)
         block_id += 1
 
-    logger.info("total write passages {}".format(total_write_passages))
-    # return embedding, embedding2id
+    logging.info("Total passages written: {}".format(total_write_passages))
 
 
 # streaming inference
@@ -184,7 +195,7 @@ def StreamInferenceDoc(args,
 
 
 
-    logger.info("merging embeddings")
+    logging.info("merging embeddings")
 
 
 def generate_new_ann(args):
@@ -196,7 +207,7 @@ def generate_new_ann(args):
 
     merge = False
 
-    logger.info("***** inference of passages *****")
+    logging.info("***** inference of passages *****")
     passage_collection_path = os.path.join(args.tokenized_passage_collection_dir_path,
                                            "passages")
     passage_cache = EmbeddingCache(passage_collection_path)
@@ -209,13 +220,13 @@ def generate_new_ann(args):
             emb,
             is_query_inference=False,
             merge=merge)
-    logger.info("***** Done passage inference *****")
+    logging.info("***** Done passage inference *****")
 
 
 
 def ann_data_gen(args):
 
-    logger.info("start generate ann data")
+    logging.info("start generate ann data")
     generate_new_ann(args)
 
     if args.local_rank != -1:
@@ -234,7 +245,7 @@ def get_args():
     config = toml.load(args.config)
     args = argparse.Namespace(**config)
     args.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    check_dir_exist_or_build([args.data_output_path])
+    os.makedirs(args.data_output_path)
     
     return args
 
